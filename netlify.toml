@@ -1,0 +1,26 @@
+[build]
+  # Derleme komutu yok, paketler deploy öncesi yüklenir
+  command = "npm install --ignore-scripts"
+  publish = "public"
+  functions = "netlify/functions"
+
+[build.environment]
+  NETLIFY = "true"
+
+[functions]
+  node_bundler = "esbuild"
+  # better-sqlite3 native modül, harici bırakılmalı
+  external_node_modules = ["better-sqlite3"]
+  included_files = ["node_modules/better-sqlite3/**"]
+
+# Tüm /api/* isteklerini serverless fonksiyona yönlendir
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/api/:splat"
+  status = 200
+
+# SPA — bilinmeyen yolları index.html'e yönlendir
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
