@@ -27,6 +27,12 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS active_timer(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,course_id INT,topic TEXT,started_at INT NOT NULL,paused_at INT,accumulated INT DEFAULT 0,mode TEXT DEFAULT 'serbest');
     CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,course_id INT REFERENCES courses(id),title TEXT NOT NULL,description TEXT,due_date TEXT,priority TEXT DEFAULT 'orta',done INT DEFAULT 0);
     CREATE TABLE IF NOT EXISTS goals(id INTEGER PRIMARY KEY,user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,title TEXT NOT NULL,period TEXT NOT NULL,target_minutes INT NOT NULL,course_id INT REFERENCES courses(id));
+    CREATE INDEX IF NOT EXISTS i_courses ON courses(user_id);
+    CREATE INDEX IF NOT EXISTS i_sched ON schedules(user_id,date);
+    CREATE INDEX IF NOT EXISTS i_notes ON notes(user_id);
+    CREATE INDEX IF NOT EXISTS i_logs ON study_logs(user_id,started_at);
+    CREATE INDEX IF NOT EXISTS i_tasks ON tasks(user_id);
+    CREATE INDEX IF NOT EXISTS i_goals ON goals(user_id);
   `);
 }
 initDb().catch(console.error);
@@ -64,7 +70,7 @@ A.post('/register', [
   if (await getOne('SELECT 1 FROM users WHERE email=? COLLATE NOCASE', [email]))
     return s.status(409).json({ error: 'Bu e-posta kayıtlı' });
   const r = await run('INSERT INTO users(full_name,username,email,password_hash) VALUES(?,?,?,?)',
-    [full_name, username, email, await bcrypt.hash(password, 12)]);
+    [full_name, username, email, await bcrypt.hash(password, 10)]);
   q.session.uid = r.lastInsertRowid;
   s.json({ ok: 1 });
 });
@@ -104,7 +110,7 @@ A.put('/me/password', auth, async (q, s) => {
     return s.status(400).json({ error: 'Mevcut şifre yanlış' });
   if (!strong(q.body.new || ''))
     return s.status(400).json({ error: 'Yeni şifre yeterince güçlü değil' });
-  await run('UPDATE users SET password_hash=? WHERE id=?', [await bcrypt.hash(q.body.new, 12), u.id]);
+  await run('UPDATE users SET password_hash=? WHERE id=?', [await bcrypt.hash(q.body.new, 10), u.id]);
   s.json({ ok: 1 });
 });
 
@@ -260,58 +266,57 @@ A.post('/timer/stop', auth, async (q, s) => {
 
 A.get('/stats', auth, async (q, s) => {
   const u = q.session.uid, d = today();
-  const sum = async (f, ...p) => {
-    const row = await getOne(`SELECT COALESCE(SUM(seconds),0) v FROM study_logs WHERE user_id=? AND ${f}`, [u, ...p]);
-    return row ? Number(row.v) : 0;
-  };
-  const daily = await query("SELECT date(started_at,'localtime') d,SUM(seconds) s FROM study_logs WHERE user_id=? AND date(started_at,'localtime')>=date('now','-6 days','localtime') GROUP BY d", [u]);
+  const now = new Date().toTimeString().slice(0, 5);
+  const L = "date(started_at,'localtime')";
+  // Tüm sorgular TEK ağ turunda (batch) çalışır
+  const [daily, byCourseRaw, monthlyRaw, per, goalRows, upcoming, lateR, tasksR, coursesR] = (await db.batch([
+    { sql: `SELECT ${L} d,SUM(seconds) s FROM study_logs WHERE user_id=? AND ${L}>=date('now','-6 days','localtime') GROUP BY d`, args: [u] },
+    { sql: 'SELECT c.name,c.color,SUM(l.seconds) seconds FROM study_logs l JOIN courses c ON c.id=l.course_id WHERE l.user_id=? GROUP BY c.id ORDER BY seconds DESC', args: [u] },
+    { sql: "SELECT strftime('%Y-%m',started_at,'localtime') m,SUM(seconds) s FROM study_logs WHERE user_id=? GROUP BY m ORDER BY m DESC LIMIT 6", args: [u] },
+    { sql: `SELECT course_id,
+      COALESCE(SUM(CASE WHEN ${L}=date('now','localtime') THEN seconds END),0) daily,
+      COALESCE(SUM(CASE WHEN ${L}>=date('now','-6 days','localtime') THEN seconds END),0) weekly,
+      COALESCE(SUM(CASE WHEN strftime('%Y-%m',started_at,'localtime')=strftime('%Y-%m','now','localtime') THEN seconds END),0) monthly
+      FROM study_logs WHERE user_id=? GROUP BY course_id`, args: [u] },
+    { sql: 'SELECT * FROM goals WHERE user_id=?', args: [u] },
+    { sql: 'SELECT s.*,c.name course_name FROM schedules s JOIN courses c ON c.id=s.course_id WHERE s.user_id=? AND s.date=? AND s.done=0 AND s.start_time>=? ORDER BY start_time LIMIT 5', args: [u, d, now] },
+    { sql: 'SELECT COUNT(*) n FROM schedules WHERE user_id=? AND date=? AND done=0 AND end_time<?', args: [u, d, now] },
+    { sql: 'SELECT COUNT(*) n FROM tasks WHERE user_id=? AND done=1', args: [u] },
+    { sql: 'SELECT COUNT(*) n FROM courses WHERE user_id=? AND archived=0', args: [u] }
+  ], 'read')).map(r => r.rows);
+
   const days = [...Array(7)].map((_, i) => {
     const x = new Date(Date.now() - (6 - i) * 864e5).toLocaleDateString('sv');
     return { date: x, seconds: Number(daily.find(r => r.d === x)?.s || 0) };
   });
-  const byCourseRaw = await query('SELECT c.name,c.color,SUM(l.seconds) seconds FROM study_logs l JOIN courses c ON c.id=l.course_id WHERE l.user_id=? GROUP BY c.id ORDER BY seconds DESC', [u]);
   const byCourse = byCourseRaw.map(c => ({ ...c, seconds: Number(c.seconds) }));
-  const monthlyRaw = await query("SELECT strftime('%Y-%m',started_at,'localtime') m,SUM(seconds) s FROM study_logs WHERE user_id=? GROUP BY m ORDER BY m DESC LIMIT 6", [u]);
   const monthly = monthlyRaw.map(m => ({ ...m, s: Number(m.s) })).reverse();
-  const week = await sum("date(started_at,'localtime')>=date('now','-6 days','localtime')");
+  const total = k => per.reduce((a, r) => a + Number(r[k]), 0);
 
-  const allGoals = await query('SELECT * FROM goals WHERE user_id=?', [u]);
-  const goals = [];
-  for (const g of allGoals) {
-    const f = { daily: "date(started_at,'localtime')=date('now','localtime')", weekly: "date(started_at,'localtime')>=date('now','-6 days','localtime')", monthly: "strftime('%Y-%m',started_at,'localtime')=strftime('%Y-%m','now','localtime')" }[g.period];
-    const row = await getOne(`SELECT COALESCE(SUM(seconds),0) v FROM study_logs WHERE user_id=? AND ${f}${g.course_id ? ' AND course_id=' + (+g.course_id) : ''}`, [u]);
-    const done = Number(row?.v || 0) / 60;
-    goals.push({ ...g, done_minutes: Math.round(done), pct: Math.min(100, Math.round(done / g.target_minutes * 100)) });
-  }
+  const goals = goalRows.map(g => {
+    const secs = g.course_id ? Number(per.find(r => r.course_id == g.course_id)?.[g.period] || 0) : total(g.period);
+    const done = secs / 60;
+    return { ...g, done_minutes: Math.round(done), pct: Math.min(100, Math.round(done / g.target_minutes * 100)) };
+  });
 
-  const now = new Date().toTimeString().slice(0, 5);
-  const upcoming = await query('SELECT s.*,c.name course_name FROM schedules s JOIN courses c ON c.id=s.course_id WHERE s.user_id=? AND s.date=? AND s.done=0 AND s.start_time>=? ORDER BY start_time LIMIT 5', [u, d, now]);
   const notifs = [];
   upcoming.forEach(x => {
     const m = (new Date(`${d}T${x.start_time}`) - Date.now()) / 6e4;
     if (m <= 60) notifs.push(`${x.course_name} çalışmanız ${Math.max(0, Math.round(m))} dk sonra başlıyor`);
   });
-  const lateRow = await getOne('SELECT COUNT(*) n FROM schedules WHERE user_id=? AND date=? AND done=0 AND end_time<?', [u, d, now]);
-  const late = Number(lateRow?.n || 0);
+  const late = Number(lateR[0]?.n || 0);
   if (late) notifs.push(`Bugün tamamlanmamış ${late} çalışma var`);
   goals.filter(g => g.pct >= 100).forEach(g => notifs.push(`"${g.title}" hedefini tamamladınız`));
 
-  const tasksDoneRow = await getOne('SELECT COUNT(*) n FROM tasks WHERE user_id=? AND done=1', [u]);
-  const activeCoursesRow = await getOne('SELECT COUNT(*) n FROM courses WHERE user_id=? AND archived=0', [u]);
-
   s.json({
-    today: await sum("date(started_at,'localtime')=date('now','localtime')"),
-    week,
-    tasksDone: Number(tasksDoneRow?.n || 0),
-    activeCourses: Number(activeCoursesRow?.n || 0),
-    days,
-    byCourse,
-    monthly,
-    goals,
-    upcoming,
-    notifs
+    today: total('daily'),
+    week: total('weekly'),
+    tasksDone: Number(tasksR[0]?.n || 0),
+    activeCourses: Number(coursesR[0]?.n || 0),
+    days, byCourse, monthly, goals, upcoming, notifs
   });
 });
+
 
 app.use('/api', A);
 
